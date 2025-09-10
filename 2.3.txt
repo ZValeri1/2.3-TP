@@ -1,0 +1,287 @@
+# === ШАГ 1: ИМПОРТ БИБЛИОТЕК ===
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from pydantic import BaseModel, Field, model_validator, RootModel
+from typing import List, Optional, Union, Literal
+import json
+import io
+import uuid
+import time
+from openai import OpenAI
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor  # Для отладки запросов
+
+# === ШАГ 2: ОТЛАДКА — Печать тела запроса к OpenAI ===
+def print_request_body(span, request):
+    try:
+        bytes_content = b''.join(chunk for chunk in request.stream)
+        content_str = bytes_content.decode('utf-8')
+        print("🔍 Отправленный запрос к OpenAI:")
+        print(json.dumps(json.loads(content_str), indent=2))
+    except Exception as e:
+        print(f"Ошибка при чтении запроса: {e}")
+
+# ВАЖНО: Инструментировать до импорта openai!
+HTTPXClientInstrumentor().instrument(request_hook=print_request_body)
+
+# === ШАГ 3: ИНИЦИАЛИЗАЦИЯ FastAPI и OpenAI ===
+app = FastAPI(title="Генератор ТП по ДСЕ", version="0.1")
+
+# Подключаемся к OpenAI (замените на свой API_KEY)
+client = OpenAI(api_key="your-openai-api-key")  # Замените на реальный ключ
+
+# === ШАГ 4: Определение моделей Pydantic (6 полей) ===
+class Operation(BaseModel):
+    operation_name: str = Field(..., description="Наименование операции (например, 'Контроль', 'Слесарная')")
+    equipment_name: str = Field(..., description="Наименование оборудования (например, 'Измерительный станок')")
+    
+    workshop_number: int = Field(..., description="Номер цеха (целое число от 1 до 10)")
+    section: str = Field(..., description="Участок (например, 'Механический', 'Контрольный', 'Сварочный')")
+    labor_time_hours: float = Field(..., description="Время трудозатрат в часах (вещественное число > 0)")
+    resources: str = Field(..., description="Ресурсы (например, 'Технолог, станок, материал')")
+
+    @model_validator(mode='after')
+    def validate_not_empty(self):
+        if not self.operation_name.strip():
+            raise ValueError("operation_name не может быть пустым")
+        if not self.equipment_name.strip():
+            raise ValueError("equipment_name не может быть пустым")
+        if not self.section.strip():
+            raise ValueError("section не может быть пустым")
+        if not self.resources.strip():
+            raise ValueError("resources не может быть пустым")
+        if self.labor_time_hours <= 0:
+            raise ValueError("labor_time_hours должен быть больше 0")
+        if not (1 <= self.workshop_number <= 10):
+            raise ValueError("workshop_number должен быть от 1 до 10")
+        return self
+
+
+class TPOutput(BaseModel):
+    operations: List[Operation] = Field(
+        ..., 
+        description="Упорядоченный список операций в техпроцессе. "
+                    "Каждая операция — это объект с 6 полями: operation_name, equipment_name, workshop_number, section, labor_time_hours, resources. "
+                    "Выбор и порядок определяются моделью на основе контекста."
+    )
+
+    @model_validator(mode='after')
+    def validate_operations(self):
+        if not self.operations:
+            raise ValueError("Список операций не может быть пустым.")
+        return self
+
+
+# === ШАГ 5: Заглушки для задач 2.2.1, 2.2.2, 1.5 ===
+def extract_metadata_from_pdf(pdf_bytes: bytes) -> dict:
+    """
+    Заглушка: извлекает метаданные чертежа.
+    Реально: OCR + извлечение из PDF.
+    """
+    return {
+        "drawing_number": "DS-789",
+        "title": "Деталь сборки узла X",
+        "revision": "A",
+        "author": "Иванов И.И.",
+        "date": "2024-04-05",
+        "mass_kg": 2.3,
+        "dimensions_mm": [100, 50, 20]
+    }
+
+def extract_description_from_pdf(pdf_bytes: bytes) -> str:
+    """
+    Заглушка: извлекает описание чертежа.
+    Реально: OCR + NLP.
+    """
+    return (
+        "Деталь представляет собой литую заготовку из алюминия АМг6. "
+        "Требуется механическая обработка всех поверхностей. "
+        "Наличие сквозных отверстий требует контроля качества сварки."
+    )
+
+def find_nearby_parts(pdf_bytes: bytes) -> List[dict]:
+    """
+    Заглушка: находит ближайшие детали-аналоги.
+    Реально: поиск по базе по массе, габаритам, материалу.
+    """
+    return [
+        {
+            "part_id": "P-101",
+            "name": "Аналог DСЕ-1",
+            "material": "АМг6",
+            "mass_kg": 2.3,
+            "dimensions_mm": [100, 50, 20],
+            "tp": [
+                {"operation": "Контроль", "equipment": "Измерительный станок"},
+                {"operation": "Слесарная", "equipment": "Станок фрезерный"},
+                {"operation": "Травление", "equipment": "Травильный стенд"}
+            ]
+        },
+        {
+            "part_id": "P-102",
+            "name": "Аналог DСЕ-2",
+            "material": "АМг6",
+            "mass_kg": 2.1,
+            "dimensions_mm": [98, 52, 18],
+            "tp": [
+                {"operation": "Контроль", "equipment": "Измерительный станок"},
+                {"operation": "Контроль материала", "equipment": "Рентген-аппарат"},
+                {"operation": "Травление", "equipment": "Травильный стенд"}
+            ]
+        }
+    ]
+
+
+# === ШАГ 6: Формирование промпта с ограничениями на 6 полей ===
+def generate_tp_prompt(metadata: dict, description: str, nearby_parts: List[dict]) -> str:
+    """
+    Собирает промпт с контекстом и жёсткими ограничениями на все 6 поля.
+    """
+
+    # Сбор уникальных пар (операция, оборудование) из всех ТП аналогов
+    unique_operations = set()
+    for part in nearby_parts:
+        for op in part["tp"]:
+            unique_operations.add((op["operation"], op["equipment"]))
+
+    # Форматируем список операций для промпта
+    operation_list = "\n".join([
+        f"{i+1}. {op[0]} ({op[1]})" 
+        for i, op in enumerate(sorted(unique_operations))
+    ])
+
+    prompt = f"""
+Вы — эксперт по технологическому проектированию. Ваша задача — создать техпроцесс для детали {metadata['title']} ({metadata['drawing_number']}) на основе анализа её аналогов.
+
+### Контекст:
+- **Описание детали**: {description}
+- **Масса**: {metadata.get('mass_kg', '?')} кг
+- **Габариты**: {metadata.get('dimensions_mm', '?')} мм
+
+### Аналоги:
+{json.dumps(nearby_parts, indent=2)}
+
+### Задача:
+Из предложенного списка операций выберите те, которые применимы к данной детали, и расположите их в правильном порядке. Вы можете использовать одну и ту же операцию несколько раз, если она нужна в разных местах. Однако **если одна и та же операция выполняется на разных станках — это разные элементы**.
+
+### Список доступных операций:
+{operation_list}
+
+### Требования к ответу:
+- Верните **упорядоченный список операций** в формате JSON.
+- Каждая операция должна содержать **все 6 поля**:
+  - `operation_name`: название операции (например, 'Контроль')
+  - `equipment_name`: название оборудования (например, 'Измерительный станок')
+  - `workshop_number`: номер цеха (целое число от 1 до 10)
+  - `section`: участок (например, 'Механический', 'Контрольный')
+  - `labor_time_hours`: время трудозатрат в часах (вещественное число > 0)
+  - `resources`: ресурсы (например, 'Технолог, станок, материал')
+
+- Не добавляйте лишние поля.
+- Никаких объяснений вне JSON.
+- Все поля обязательны.
+
+### Пример ответа:
+{{
+  "operations": [
+    {{
+      "operation_name": "Контроль",
+      "equipment_name": "Измерительный станок",
+      "workshop_number": 3,
+      "section": "Контрольный",
+      "labor_time_hours": 0.3,
+      "resources": "Технолог, измерительный прибор"
+    }},
+    {{
+      "operation_name": "Контроль материала",
+      "equipment_name": "Рентген-аппарат",
+      "workshop_number": 5,
+      "section": "Контрольный",
+      "labor_time_hours": 0.5,
+      "resources": "Рентгенолог, аппарат"
+    }}
+  ]
+}}
+    """.strip()
+
+    return prompt
+
+
+# === ШАГ 7: Основной эндпоинт /generate-tp ===
+@app.post("/generate-tp")
+async def generate_tp(file: UploadFile = File(...)):
+    """
+    Эндпоинт: принимает PDF с изображением ДСЕ, генерирует ТП.
+    """
+    
+    # Проверка типа файла
+    if not file.content_type.startswith("application/pdf"):
+        raise HTTPException(status_code=400, detail="Файл должен быть PDF")
+
+    # Читаем байты
+    pdf_bytes = await file.read()
+    
+    # Заглушки: извлечение информации
+    metadata = extract_metadata_from_pdf(pdf_bytes)
+    description = extract_description_from_pdf(pdf_bytes)
+    nearby_parts = find_nearby_parts(pdf_bytes)
+
+    # Собираем промпт
+    prompt = generate_tp_prompt(metadata, description, nearby_parts)
+
+    # Генерация через OpenAI с использованием structured output
+    try:
+        completion = client.beta.chat.completions.parse(
+            model="gpt-4o-2024-11-20",  # или gpt-4-turbo
+            response_format=TPOutput,
+            messages=[
+                {"role": "system", "content": "Вы — технологический эксперт. Отвечайте только в формате JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=1024,
+            strict=True  # Заставляет модель строго следовать схеме
+        )
+        
+        # Получаем результат
+        tp_output = completion.choices[0].message.parsed
+
+        # Пересчёт времени трудозатрат (простой пример)
+        base_mass = metadata.get("mass_kg", 2.0)
+        base_size = sum(metadata.get("dimensions_mm", [10, 10, 10])) / 3
+        avg_time_per_unit = 0.5
+        estimated_total_time = (base_mass + base_size) * avg_time_per_unit
+
+        # Конвертируем в Markdown таблицу
+        markdown_table = "| Наименование операции | Наименование оборудования | Номер цеха | Участок | Время трудозатрат (час) | Ресурсы |\n"
+        markdown_table += "|---|---|---|---|---|---|\n"
+
+        for i, op in enumerate(tp_output.operations):
+            # Автоматическое назначение цеха/участка (можно заменить на реальную логику)
+            workshop_num = op.workshop_number or (i + 1)
+            section = op.section or ("Механический" if "Слесарная" in op.operation_name else "Контрольный")
+            labor_time = op.labor_time_hours or 0.3
+            resources = op.resources or "Не указано"
+
+            markdown_table += f"| {op.operation_name} | {op.equipment_name} | {workshop_num} | {section} | {labor_time:.2f} | {resources} |\n"
+
+        # Добавляем итоговое время
+        markdown_table += f"| **ИТОГО** | | | | **{estimated_total_time:.2f}** | |\n"
+
+        # Возвращаем результат
+        return {
+            "status": "success",
+            "generated_tp": tp_output.model_dump(),
+            "markdown_table": markdown_table,
+            "total_estimated_time_hours": estimated_total_time
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка генерации ТП: {str(e)}")
+
+
+# === ШАГ 8: Запуск сервера (для Jupyter) ===
+if __name__ == "__main__":
+    import uvicorn
+    print("🚀 Запускаем FastAPI-сервер на http://localhost:8000")
+    print("📌 Чтобы отправить PDF, используйте curl или Postman:")
+    print("curl -X POST http://localhost:8000/generate-tp -F 'file=@example.pdf'")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
