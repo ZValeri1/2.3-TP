@@ -1,0 +1,165 @@
+# === ИМПОРТЫ ===
+import os
+import json
+import io
+import uuid
+from fastapi import File, UploadFile
+from pydantic import BaseModel, Field, model_validator
+from typing import List, Optional, Union
+from openai import OpenAI
+from PIL import Image
+import fitz  # PyMuPDF
+import base64
+# === ЛОКАЛЬНАЯ МОДЕЛЬ (VLM) ===
+VLM_BASE_URL = "http://10.201.3.112:8000/v1"
+VLM_API_KEY = "EMPTY"
+VLM_MODEL = "Qwen2.5-VL-72B-Instruct-AWQ"
+VLM_TEMPERATURE = 0.0
+
+try:
+    from openai import OpenAI
+    vlm_client = OpenAI(base_url=VLM_BASE_URL, api_key=VLM_API_KEY)
+except Exception as e:
+    print(f"❌ Ошибка подключения к VLM: {e}")
+    vlm_client = None
+
+def render_pdf_pages_in_memory(pdf_path: str, dpi: int = 150):
+    """
+    Конвертирует PDF в список PIL.Image.
+    """
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"Файл не найден: {pdf_path}")
+
+    doc = fitz.open(pdf_path)
+    zoom = dpi / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    out = []
+    for page in doc:
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        out.append(img)
+    doc.close()
+    return out
+
+def image_to_base64(img: Image.Image) -> str:
+    """Конвертирует PIL.Image в base64."""
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+class DrawingDescription(BaseModel):
+    title: str = Field(..., description="Название детали или сборки")
+    material: str = Field(..., description="Материал детали (например, АМг6)")
+    mass_kg: float = Field(..., description="Масса детали в килограммах (вещественное число)")
+    dimensions_mm: List[float] = Field(..., description="Габаритные размеры в миллиметрах [длина, ширина, высота]")
+    description: str = Field(..., description="Общее описание детали: назначение, особенности, обработка")
+
+    @model_validator(mode='after')
+    def validate_dimensions(self):
+        if len(self.dimensions_mm) != 3:
+            raise ValueError("dimensions_mm должен содержать ровно 3 значения")
+        return self
+
+def generate_drawing_description(pdf_path: str, use_json: bool = True):
+    """
+    Генерирует описание чертежа по PDF.
+    
+    Args:
+        pdf_path (str): Путь к PDF-файлу.
+        use_json (bool): Если True — возвращает JSON. Если False — только текст.
+    
+    Returns:
+        dict: Словарь с ключами 'json' и/или 'text'.
+    """
+    if not vlm_client:
+        return {"error": "VLM недоступен"}
+
+    try:
+        # Шаг 1: Извлечение изображений
+        pages = render_pdf_pages_in_memory(pdf_path)
+        if not pages:
+            return {"error": "Не удалось извлечь изображения из PDF"}
+
+        # Шаг 2: Конвертация в base64
+        images_b64 = [image_to_base64(page) for page in pages]
+
+        # Шаг 3: Создание сообщений для VLM
+        system_prompt = (
+            "Вы — эксперт по техническому анализу чертежей.\n"
+            "Проанализируйте изображение и извлеките следующую информацию:\n"
+            "- Название детали\n"
+            "- Материал\n"
+            "- Масса в килограммах\n"
+            "- Габаритные размеры (длина, ширина, высота) в мм\n"
+            "- Общее описание детали (назначение, особенности)\n"
+            "\n"
+            "Если информация отсутствует — оставьте пустые поля.\n"
+            "\n"
+            "Верните только JSON в формате:\n"
+            "{\n"
+            '  "title": "string",\n'
+            '  "material": "string",\n'
+            '  "mass_kg": number,\n'
+            '  "dimensions_mm": [number, number, number],\n'
+            '  "description": "string"\n'
+            "}\n"
+            "Никаких дополнительных объяснений!"
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+        ]
+
+        # Добавляем изображения
+        for b64 in images_b64:
+            uri = f"data:image/png;base64,{b64}"
+            messages.append({"role": "user", "content": [{"type": "image_url", "image_url": {"url": uri}}]})
+
+        # Шаг 4: Генерация
+        completion = vlm_client.beta.chat.completions.parse(
+            model=VLM_MODEL,
+            response_format=DrawingDescription,
+            messages=messages,
+            temperature=VLM_TEMPERATURE
+        )
+
+        # Парсим результат
+        parsed = completion.choices[0].message.parsed
+
+        # Шаг 5: Формируем ответ
+        result = {}
+        if use_json:
+            result["json"] = parsed.model_dump()
+
+        # Текстовый ответ
+        text = (
+            f" Название: {parsed.title}\n"
+            f"Материал: {parsed.material}\n"
+            f"Масса: {parsed.mass_kg} кг\n"
+            f"Габариты: {parsed.dimensions_mm[0]}×{parsed.dimensions_mm[1]}×{parsed.dimensions_mm[2]} мм\n"
+            f"Описание: {parsed.description}"
+        )
+        result["text"] = text
+
+        return result
+
+    except Exception as e:
+        return {"error": str(e)}
+
+# === ТЕСТИРОВАНИЕ ===
+if __name__ == "__main__":
+    # Укажи путь к своему PDF
+    pdf_path = "/tmp/example.pdf"  # замени на свой
+
+    # Вызов функции
+    result = generate_drawing_description(pdf_path, use_json=True)
+
+    # Вывод
+    if "error" in result:
+        print("Ошибка:", result["error"])
+    else:
+        print("JSON:")
+        print(json.dumps(result["json"], indent=2))
+
+        print("\n📄 Текст:")
+        print(result["text"])
